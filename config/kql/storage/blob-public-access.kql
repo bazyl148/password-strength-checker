@@ -11,3 +11,34 @@ StorageBlobLogs
     OperationName,
     TlsVersion
 | top 15 by TimeGenerated
+
+
+
+// Test v0.1
+
+// Management plane detection - public access enabled from AzureActivity
+let mgmtEvents = AzureActivity
+| where TimeGenerated >= ago(1d)
+| where CategoryValue == "Administrative"
+| where parse_json(Properties).resourceProviderValue == "MICROSOFT.STORAGE"
+| where parse_json(Properties).message == "Microsoft.Storage/storageAccounts/write"
+| extend AllowBlobPublicAccess = tostring(parse_json(tostring(parse_json(tostring(Properties_d.requestbody)).properties)).allowBlobPublicAccess)
+| where AllowBlobPublicAccess contains "true"
+| project TimeGenerated, Caller, CallerIpAddress, ResourceId;
+
+// Data plane detection - suspect blob access by malicious IPs
+let threatIPs = ThreatIntelligenceIndicator
+    | where Active == true and isnotempty(NetworkIP)
+    | project TI_IpAddr = NetworkIP;
+let dpEvents = StorageBlobLogs
+| where TimeGenerated >= ago(1d)
+| where StatusCode == 200 or StatusText =~ "Success"
+| where AuthenticationType == "Anonymous"
+| extend IpAddr = extract(@"((?:\d{1,3}\.){3}\d{1,3}|(?:[a-fA-F0-9]{1,4}:){2,7}[a-fA-F0-9]{1,4})", 1, CallerIpAddress)
+| join kind=inner (threatIPs) on $left.IpAddr == $right.TI_IpAddr
+| project TimeGenerated, AccountName, IpAddr, Location, OperationName, TlsVersion, ObjectKey, IpAddr;
+
+// Combine: Find blob accesses from known-bad IPs after public access enabled
+mgmtEvents
+| join kind=inner (dpEvents) on ResourceId
+| project mgmtEvents.TimeGenerated, mgmtEvents.Caller, mgmtEvents.ResourceId, dpEvents.IpAddr, dpEvents.Location, dpEvents.ObjectKey, dpEvents.OperationName
